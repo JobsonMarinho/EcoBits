@@ -41,6 +41,21 @@ leaderboard:
   # Time in seconds for the lifetime of the leaderboard cache.
   cache-lifetime: 60
 
+# In-memory (Caffeine) caching to reduce data reads when placeholders are used heavily.
+cache:
+  # Time in milliseconds to cache balances shown by placeholders.
+  # Balances update instantly on the server that changes them; this TTL only
+  # bounds how long a balance changed on ANOTHER server (non-local currencies
+  # over MySQL/MongoDB) may take to appear in placeholders. Money commands and
+  # payments always read the live balance, so they are never affected.
+  # Set to 0 to disable.
+  balance-ttl: 1000
+
+  # Time in milliseconds to cache formatted balance strings (DecimalFormat output).
+  # Purely derived from the balance, so there is no staleness risk.
+  # Set to 0 to disable.
+  format-ttl: 1000
+
 # Shortcut names for short currency format, ordered by magnitude.
 shortcuts: ["", "k", "M", "B", "T", "P", "E"]
 

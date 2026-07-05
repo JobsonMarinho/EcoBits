@@ -2,6 +2,7 @@
 
 package com.willfp.ecobits.currencies
 
+import com.github.benmanes.caffeine.cache.Cache
 import com.github.benmanes.caffeine.cache.Caffeine
 import com.willfp.eco.core.config.interfaces.Config
 import com.willfp.eco.core.data.keys.PersistentDataKey
@@ -24,6 +25,7 @@ import org.bukkit.plugin.ServicePriority
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.text.DecimalFormat
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 import kotlin.math.floor
 import kotlin.math.log10
@@ -35,9 +37,19 @@ open class Currency(
     val config: Config
 ) {
 
-    private val descCache = Caffeine.newBuilder()
-        .expireAfterWrite(plugin.configYml.getInt("gui.cache-ttl").toLong(), TimeUnit.MILLISECONDS)
-        .build<Int, String>()
+    // Caches balances for the display hot path (placeholders). Money logic never
+    // reads from here — it goes through the authoritative uncached getBalance.
+    private val balanceCache: Cache<UUID, BigDecimal> = Caffeine.newBuilder()
+        .expireAfterWrite(plugin.configYml.getInt("cache.balance-ttl").toLong(), TimeUnit.MILLISECONDS)
+        .maximumSize(MAX_CACHE_SIZE)
+        .build<UUID, BigDecimal>()
+
+    // Caches formatted balance strings (DecimalFormat output). Purely derived from
+    // the balance, so there is no staleness risk.
+    internal val formatCache: Cache<String, String> = Caffeine.newBuilder()
+        .expireAfterWrite(plugin.configYml.getInt("cache.format-ttl").toLong(), TimeUnit.MILLISECONDS)
+        .maximumSize(MAX_CACHE_SIZE)
+        .build<String, String>()
 
     val default = BigDecimal(config.getDouble("default"))
 
@@ -95,7 +107,7 @@ open class Currency(
                 plugin,
                 id
             ) {
-                it.getBalance(this).decimalFormat(this)
+                it.getDisplayBalance(this).decimalFormat(this)
             }
         )
 
@@ -104,7 +116,7 @@ open class Currency(
                 plugin,
                 "${id}_short"
             ) {
-                it.getBalance(this).decimalFormatShort(this)
+                it.getDisplayBalance(this).decimalFormatShort(this)
             }
         )
 
@@ -113,7 +125,7 @@ open class Currency(
                 plugin,
                 "${id}_formatted"
             ) {
-                it.getBalance(this).format(this)
+                it.getDisplayBalance(this).format(this)
             }
         )
 
@@ -122,7 +134,7 @@ open class Currency(
                 plugin,
                 "${id}_formatted_short"
             ) {
-                it.getBalance(this).formatShort(this)
+                it.getDisplayBalance(this).formatShort(this)
             }
         )
 
@@ -131,7 +143,7 @@ open class Currency(
                 plugin,
                 "${id}_raw"
             ) {
-                it.getBalance(this).toPlainString()
+                it.getDisplayBalance(this).toPlainString()
             }
         )
 
@@ -140,7 +152,7 @@ open class Currency(
                 plugin,
                 "${id}_commas"
             ) {
-                it.getBalance(this).formatWithCommas()
+                it.getDisplayBalance(this).formatWithCommas()
             }
         )
 
@@ -149,7 +161,7 @@ open class Currency(
                 plugin,
                 "${id}_integer"
             ) {
-                it.getBalance(this).toInt().toString()
+                it.getDisplayBalance(this).toInt().toString()
             }
         )
 
@@ -211,12 +223,22 @@ open class Currency(
     internal open fun getBalance(player: OfflinePlayer) = getSavedBalance(player)
     internal fun getSavedBalance(player: OfflinePlayer) = player.profile.read(key)
 
+    internal fun getDisplayBalance(player: OfflinePlayer): BigDecimal =
+        balanceCache.get(player.uniqueId) { getSavedBalance(player) }
+
+    internal fun updateCachedBalance(uuid: UUID, value: BigDecimal) =
+        balanceCache.put(uuid, value)
+
     override fun equals(other: Any?): Boolean {
         return other is Currency && other.id == this.id
     }
 
     override fun hashCode(): Int {
         return this.id.hashCode()
+    }
+
+    private companion object {
+        const val MAX_CACHE_SIZE = 10_000L
     }
 }
 
@@ -260,25 +282,34 @@ fun BigDecimal.formatShort(currency: Currency): String {
 }
 
 fun BigDecimal.decimalFormat(currency: Currency): String {
-    val stripped = this.stripTrailingZeros()
-    return currency.decimalFormat.format(stripped)
+    val amount = this
+    return currency.formatCache.get("decimal:${amount.toPlainString()}") {
+        currency.decimalFormat.format(amount.stripTrailingZeros())
+    }
 }
 
 fun BigDecimal.decimalFormatShort(currency: Currency): String {
-    val numValue = this.toLong()
-    val value = floor(log10(numValue.toDouble())).toInt()
+    val amount = this
+    return currency.formatCache.get("decimal-short:${amount.toPlainString()}") {
+        val numValue = amount.toLong()
+        val value = floor(log10(numValue.toDouble())).toInt()
 
-    val base = value / 3
+        val base = value / 3
 
-    return if (value >= 3 && base < plugin.shortcuts.size) {
-        currency.decimalFormatShort.format(numValue / 10.0.pow((base * 3).toDouble())) + plugin.shortcuts[base]
-    } else {
-        currency.decimalFormatShort.format(numValue)
+        if (value >= 3 && base < plugin.shortcuts.size) {
+            currency.decimalFormatShort.format(numValue / 10.0.pow((base * 3).toDouble())) + plugin.shortcuts[base]
+        } else {
+            currency.decimalFormatShort.format(numValue)
+        }
     }
 }
 
 fun OfflinePlayer.getBalance(currency: Currency): BigDecimal {
     return this.profile.read(currency.key)
+}
+
+fun OfflinePlayer.getDisplayBalance(currency: Currency): BigDecimal {
+    return currency.getDisplayBalance(this)
 }
 
 fun OfflinePlayer.setBalance(currency: Currency, value: BigDecimal) {
@@ -289,6 +320,8 @@ fun OfflinePlayer.setBalance(currency: Currency, value: BigDecimal) {
         currency.key,
         coerced
     )
+
+    currency.updateCachedBalance(this.uniqueId, coerced)
 }
 
 fun OfflinePlayer.adjustBalance(currency: Currency, by: BigDecimal) {
